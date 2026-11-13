@@ -1,5 +1,7 @@
 """Tests for qcrawl.storage"""
 
+from unittest.mock import patch
+
 import pytest
 
 from qcrawl.storage import FileStorage, Storage
@@ -123,6 +125,85 @@ async def test_file_storage_write_appends_data(tmp_path):
 
     file_path = tmp_path / "append.txt"
     assert file_path.read_bytes() == b"Line 1\nLine 2\nLine 3\n"
+
+
+# FileStorage Atomic Commit Tests
+
+
+@pytest.mark.asyncio
+async def test_file_storage_commit_writes_new_file(tmp_path):
+    """commit creates a file with exactly the given bytes."""
+    storage = FileStorage(root=tmp_path)
+
+    await storage.commit(b"complete document", "committed.txt")
+
+    assert (tmp_path / "committed.txt").read_bytes() == b"complete document"
+
+
+@pytest.mark.asyncio
+async def test_file_storage_commit_replaces_existing_file(tmp_path):
+    """commit atomically replaces rather than appends to an existing file."""
+    storage = FileStorage(root=tmp_path)
+    target = tmp_path / "doc.txt"
+    target.write_bytes(b"old complete content")
+
+    await storage.commit(b"new complete content", "doc.txt")
+
+    assert target.read_bytes() == b"new complete content"
+
+
+@pytest.mark.asyncio
+async def test_file_storage_commit_failure_keeps_previous_file(tmp_path):
+    """If the staging step fails, the previously committed file is untouched."""
+    storage = FileStorage(root=tmp_path)
+    target = tmp_path / "doc.txt"
+    target.write_bytes(b"previous")
+
+    with (
+        patch("qcrawl.storage.tempfile.mkstemp", side_effect=OSError("simulated failure")),
+        pytest.raises(OSError, match="simulated failure"),
+    ):
+        await storage.commit(b"replacement", "doc.txt")
+
+    assert target.read_bytes() == b"previous"
+    # No staging file is left behind.
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_file_storage_commit_replace_failure_keeps_previous_file(tmp_path):
+    """If the final atomic rename fails, the temp file is cleaned up, old file kept."""
+    storage = FileStorage(root=tmp_path)
+    target = tmp_path / "doc.txt"
+    target.write_bytes(b"previous")
+
+    with (
+        patch("qcrawl.storage.os.replace", side_effect=OSError("rename failed")),
+        pytest.raises(OSError, match="rename failed"),
+    ):
+        await storage.commit(b"replacement", "doc.txt")
+
+    assert target.read_bytes() == b"previous"
+    assert not list(tmp_path.glob(".*.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_file_storage_commit_creates_subdirectories(tmp_path):
+    """commit creates missing parent directories like write does."""
+    storage = FileStorage(root=tmp_path)
+
+    await storage.commit(b"x", "sub/dir/doc.txt")
+
+    assert (tmp_path / "sub" / "dir" / "doc.txt").read_bytes() == b"x"
+
+
+@pytest.mark.asyncio
+async def test_file_storage_commit_rejects_path_traversal(tmp_path):
+    """commit applies the same root-escape guard as write."""
+    storage = FileStorage(root=tmp_path / "store")
+
+    with pytest.raises(ValueError, match="escapes storage root"):
+        await storage.commit(b"x", "../escape.txt")
 
 
 # FileStorage Path Safety Tests

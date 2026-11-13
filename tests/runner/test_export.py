@@ -1,16 +1,28 @@
-"""Tests for qcrawl.runner.export - Exporter factory and handler registration
+"""Tests for qcrawl.runner.export - Exporter factory and export transactions
 
 Tests focus on the following behavior:
 - Exporter selection based on format (ndjson, json, csv, xml)
 - Buffer size and mode parameter handling
 - Export handler registration with signal system
-- File and stdout output integration
+- File, storage and stdout output integration
+- Transactional commit: failures propagate to the ExportTransaction and a failed
+  run never overwrites a previously complete file.
 """
+
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from qcrawl.core.item import Item
-from qcrawl.runner.export import build_exporter
+from qcrawl.runner.export import (
+    ExportError,
+    ExportTransaction,
+    build_exporter,
+    register_export_handlers,
+)
+from qcrawl.signals import SignalRegistry
+from qcrawl.storage import FileStorage
 
 # Exporter Selection Tests
 
@@ -19,7 +31,6 @@ def test_build_exporter_ndjson():
     """build_exporter returns JsonLinesExporter for ndjson format."""
     exporter = build_exporter("ndjson")
 
-    # Serialize an item to verify it's the right exporter type
     item = Item(data={"test": "value"})
     result = exporter.serialize_item(item)
 
@@ -27,20 +38,19 @@ def test_build_exporter_ndjson():
 
 
 def test_build_exporter_json_buffered():
-    """build_exporter returns JsonBufferedExporter for json+buffered mode."""
+    """build_exporter returns a buffering JSON exporter for json+buffered."""
     exporter = build_exporter("json", mode="buffered", buffer_size=2)
 
     item1 = Item(data={"id": 1})
     item2 = Item(data={"id": 2})
 
-    # First item should buffer (return None)
-    result1 = exporter.serialize_item(item1)
-    assert result1 is None, "Should buffer first item"
+    # Buffered exporters accumulate and return None until close.
+    assert exporter.serialize_item(item1) is None
+    assert exporter.serialize_item(item2) is None
 
-    # Second item should trigger flush
-    result2 = exporter.serialize_item(item2)
-    assert result2 is not None, "Should flush when buffer full"
-    assert b'"id":' in result2, "Should contain JSON data"
+    import orjson
+
+    assert orjson.loads(exporter.close()) == [{"id": 1}, {"id": 2}]
 
 
 def test_build_exporter_json_stream():
@@ -50,20 +60,19 @@ def test_build_exporter_json_stream():
     item = Item(data={"test": "value"})
     result = exporter.serialize_item(item)
 
-    # Stream mode should use JsonLinesExporter (immediate output)
     assert result == b'{"test":"value"}\n', "Should produce NDJSON in stream mode"
 
 
 def test_build_exporter_csv():
-    """build_exporter returns CsvExporter for csv format."""
+    """build_exporter returns CsvExporter for csv format (buffered)."""
     exporter = build_exporter("csv")
 
-    item = Item(data={"name": "test", "value": "123"})
-    result = exporter.serialize_item(item)
+    # CSV now buffers; the document appears on close.
+    assert exporter.serialize_item(Item(data={"name": "test", "value": "123"})) is None
+    blob = exporter.close()
 
-    # CSV exporter outputs each item immediately with header
-    assert result is not None, "CSV should output data"
-    assert b"name,value" in result or b"name" in result, "Should have CSV header or data"
+    assert b"name,value" in blob
+    assert b"test" in blob and b"123" in blob
 
 
 def test_build_exporter_xml():
@@ -74,9 +83,9 @@ def test_build_exporter_xml():
     exporter.serialize_item(item)
     result = exporter.close()
 
-    assert result is not None, "Should return XML data"
-    assert b"<items>" in result, "Should have XML structure"
-    assert b"<test>value</test>" in result, "Should have XML data"
+    assert result is not None
+    assert b"<items>" in result
+    assert b"<test>value</test>" in result
 
 
 @pytest.mark.parametrize(
@@ -84,7 +93,7 @@ def test_build_exporter_xml():
     [
         ("ndjson", b'{"test":"value"}\n'),
         ("NDJSON", b'{"test":"value"}\n'),  # Case insensitive
-        ("json", None),  # Buffered returns None until buffer full
+        ("json", None),  # Buffered returns None until close
     ],
 )
 def test_build_exporter_case_insensitive(format_name, expected_contains):
@@ -95,6 +104,8 @@ def test_build_exporter_case_insensitive(format_name, expected_contains):
 
     if expected_contains:
         assert result == expected_contains
+    else:
+        assert result is None
 
 
 def test_build_exporter_unknown_format():
@@ -113,21 +124,17 @@ def test_build_exporter_none_format():
 
 
 def test_build_exporter_custom_buffer_size():
-    """build_exporter respects custom buffer_size parameter."""
+    """build_exporter passes buffer_size through to the buffered JSON exporter."""
     exporter = build_exporter("json", mode="buffered", buffer_size=3)
+    assert exporter.buffer_size == 3
 
-    # Add 2 items - should buffer
     exporter.serialize_item(Item(data={"id": 1}))
-    result = exporter.serialize_item(Item(data={"id": 2}))
-    assert result is None, "Should buffer with size 2 < 3"
+    exporter.serialize_item(Item(data={"id": 2}))
+    assert exporter.serialize_item(Item(data={"id": 3})) is None
 
-    # Add 3rd item - should flush
-    result = exporter.serialize_item(Item(data={"id": 3}))
-    assert result is not None, "Should flush when buffer reaches size 3"
-    # Check for all 3 items in output (with or without spaces in JSON formatting)
-    assert isinstance(result, bytes), "Should return bytes"
-    assert b'"id"' in result, "Should contain JSON data"
-    assert result.count(b'"id"') == 3, "Should contain all 3 items"
+    import orjson
+
+    assert orjson.loads(exporter.close()) == [{"id": 1}, {"id": 2}, {"id": 3}]
 
 
 # Mode Parameter Tests
@@ -137,33 +144,29 @@ def test_build_exporter_custom_buffer_size():
 def test_build_exporter_mode_case_insensitive(mode):
     """build_exporter handles mode parameter case-insensitively."""
     exporter = build_exporter("json", mode=mode, buffer_size=1)
-    item = Item(data={"test": "value"})
 
-    # Buffered mode should return result when buffer is full
-    result = exporter.serialize_item(item)
-    assert result is not None, "Buffered mode should work regardless of case"
+    assert exporter.serialize_item(Item(data={"test": "value"})) is None
+    assert exporter.close() is not None
 
 
 # Export Handler Integration Tests
 
 
-@pytest.mark.asyncio
-async def test_register_export_handlers_file_export(tmp_path):
-    """register_export_handlers writes items to file when item_scraped signal fires."""
-    from types import SimpleNamespace
-
-    from qcrawl.runner.export import register_export_handlers
-    from qcrawl.signals import SignalRegistry
-
-    # Arrange - Set up exporter, dispatcher, and file path
-    output_file = tmp_path / "output.ndjson"
-    exporter = build_exporter("ndjson")
+def _registry_and_crawler():
     registry = SignalRegistry()
     dispatcher = registry.for_sender(None)
     crawler = SimpleNamespace(_cli_signal_handlers=[])
+    return dispatcher, crawler
 
-    # Register handlers - this is the function we're testing
-    register_export_handlers(
+
+@pytest.mark.asyncio
+async def test_register_export_handlers_file_export(tmp_path):
+    """register_export_handlers commits items to file on spider_closed."""
+    output_file = tmp_path / "output.ndjson"
+    exporter = build_exporter("ndjson")
+    dispatcher, crawler = _registry_and_crawler()
+
+    transaction = register_export_handlers(
         dispatcher=dispatcher,
         exporter=exporter,
         crawler=crawler,
@@ -171,38 +174,29 @@ async def test_register_export_handlers_file_export(tmp_path):
         file_path=output_file,
     )
 
-    # Act - Emit item_scraped signal
     test_item = Item(data={"name": "test", "value": 123})
     await dispatcher.send_async("item_scraped", item=test_item, spider=None)
 
-    # Emit spider_closed to finalize export
+    # Nothing is written before the transaction commits.
+    assert not output_file.exists()
+
     await dispatcher.send_async("spider_closed", spider=None, reason="finished")
 
-    # Assert - Check file was written
-    assert output_file.exists(), "Output file should be created"
+    assert output_file.exists()
+    assert transaction.committed is True
+    transaction.raise_if_failed()  # must not raise
 
     content = output_file.read_text()
-    assert "test" in content, "File should contain scraped data"
-    assert "123" in content, "File should contain item values"
+    assert "test" in content and "123" in content
 
 
 @pytest.mark.asyncio
 async def test_register_export_handlers_stdout_export(capsys):
-    """register_export_handlers writes items to stdout when file_path is '-'."""
-    from pathlib import Path
-    from types import SimpleNamespace
-
-    from qcrawl.runner.export import register_export_handlers
-    from qcrawl.signals import SignalRegistry
-
-    # Arrange - Set up exporter for stdout
+    """register_export_handlers streams items to stdout when file_path is '-'."""
     exporter = build_exporter("ndjson")
-    registry = SignalRegistry()
-    dispatcher = registry.for_sender(None)
-    crawler = SimpleNamespace(_cli_signal_handlers=[])
+    dispatcher, crawler = _registry_and_crawler()
 
-    # Use "-" as file_path to indicate stdout
-    register_export_handlers(
+    transaction = register_export_handlers(
         dispatcher=dispatcher,
         exporter=exporter,
         crawler=crawler,
@@ -210,32 +204,21 @@ async def test_register_export_handlers_stdout_export(capsys):
         file_path=Path("-"),
     )
 
-    # Act - Emit item_scraped signal
     test_item = Item(data={"output": "stdout"})
     await dispatcher.send_async("item_scraped", item=test_item, spider=None)
-
-    # Emit spider_closed
     await dispatcher.send_async("spider_closed", spider=None, reason="finished")
 
-    # Assert - Check stdout output
     captured = capsys.readouterr()
-    assert "stdout" in captured.out, "Should write to stdout"
+    assert "stdout" in captured.out
+    transaction.raise_if_failed()
 
 
 @pytest.mark.asyncio
 async def test_register_export_handlers_multiple_items(tmp_path):
-    """register_export_handlers writes multiple items correctly."""
-    from types import SimpleNamespace
-
-    from qcrawl.runner.export import register_export_handlers
-    from qcrawl.signals import SignalRegistry
-
-    # Arrange
+    """Every scraped item ends up in the committed file exactly once."""
     output_file = tmp_path / "multi.ndjson"
     exporter = build_exporter("ndjson")
-    registry = SignalRegistry()
-    dispatcher = registry.for_sender(None)
-    crawler = SimpleNamespace(_cli_signal_handlers=[])
+    dispatcher, crawler = _registry_and_crawler()
 
     register_export_handlers(
         dispatcher=dispatcher,
@@ -245,40 +228,29 @@ async def test_register_export_handlers_multiple_items(tmp_path):
         file_path=output_file,
     )
 
-    # Act - Emit multiple items
     items = [
         Item(data={"id": 1, "name": "first"}),
         Item(data={"id": 2, "name": "second"}),
         Item(data={"id": 3, "name": "third"}),
     ]
-
     for item in items:
         await dispatcher.send_async("item_scraped", item=item, spider=None)
 
     await dispatcher.send_async("spider_closed", spider=None, reason="finished")
 
-    # Assert - Check all items were written
-    content = output_file.read_text()
-    lines = [line for line in content.split("\n") if line.strip()]
-
-    assert len(lines) == 3, "Should have 3 items"
-    assert "first" in content and "second" in content and "third" in content
+    lines = [line for line in output_file.read_text().split("\n") if line.strip()]
+    assert len(lines) == 3
+    assert "first" in output_file.read_text()
 
 
 @pytest.mark.asyncio
 async def test_register_export_handlers_buffered_json(tmp_path):
-    """register_export_handlers handles buffered JSON export correctly."""
-    from types import SimpleNamespace
+    """Buffered JSON commits one valid JSON array on close."""
+    import orjson
 
-    from qcrawl.runner.export import register_export_handlers
-    from qcrawl.signals import SignalRegistry
-
-    # Arrange - Use buffered JSON exporter
     output_file = tmp_path / "buffered.json"
     exporter = build_exporter("json", mode="buffered", buffer_size=2)
-    registry = SignalRegistry()
-    dispatcher = registry.for_sender(None)
-    crawler = SimpleNamespace(_cli_signal_handlers=[])
+    dispatcher, crawler = _registry_and_crawler()
 
     register_export_handlers(
         dispatcher=dispatcher,
@@ -288,32 +260,216 @@ async def test_register_export_handlers_buffered_json(tmp_path):
         file_path=output_file,
     )
 
-    # Act - Add items
     await dispatcher.send_async("item_scraped", item=Item(data={"id": 1}), spider=None)
     await dispatcher.send_async("item_scraped", item=Item(data={"id": 2}), spider=None)
     await dispatcher.send_async("spider_closed", spider=None, reason="finished")
 
-    # Assert - Should have JSON array format
-    content = output_file.read_text()
-    assert '"id"' in content, "Should contain JSON data"
-    # Buffered mode produces JSON arrays
-    assert "[" in content or "{" in content, "Should have JSON structure"
+    assert orjson.loads(output_file.read_bytes()) == [{"id": 1}, {"id": 2}]
+
+
+@pytest.mark.asyncio
+async def test_register_export_handlers_csv_stable_header(tmp_path):
+    """End-to-end CSV: later fields yield one header and aligned rows."""
+    import csv as csv_mod
+    import io
+
+    output_file = tmp_path / "out.csv"
+    exporter = build_exporter("csv")
+    dispatcher, crawler = _registry_and_crawler()
+
+    register_export_handlers(
+        dispatcher=dispatcher,
+        exporter=exporter,
+        crawler=crawler,
+        storage=None,
+        file_path=output_file,
+    )
+
+    await dispatcher.send_async(
+        "item_scraped", item=Item(data={"name": "Alice", "age": "30"}), spider=None
+    )
+    await dispatcher.send_async(
+        "item_scraped",
+        item=Item(data={"name": "Bob", "age": "25", "city": "NYC"}),
+        spider=None,
+    )
+    await dispatcher.send_async("spider_closed", spider=None, reason="finished")
+
+    rows = list(csv_mod.DictReader(io.StringIO(output_file.read_text())))
+    assert rows == [
+        {"age": "30", "city": "", "name": "Alice"},
+        {"age": "25", "city": "NYC", "name": "Bob"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_register_export_handlers_storage_commit(tmp_path):
+    """Storage destinations are written via one atomic commit on close."""
+    storage = FileStorage(root=tmp_path / "store")
+    exporter = build_exporter("ndjson")
+    dispatcher, crawler = _registry_and_crawler()
+
+    transaction = register_export_handlers(
+        dispatcher=dispatcher,
+        exporter=exporter,
+        crawler=crawler,
+        storage=storage,
+        file_path=None,
+        storage_relpath="nested/output.ndjson",
+    )
+
+    await dispatcher.send_async("item_scraped", item=Item(data={"id": 1}), spider=None)
+    # No partial writes during the run.
+    assert not (tmp_path / "store" / "nested").exists()
+
+    await dispatcher.send_async("spider_closed", spider=None, reason="finished")
+
+    target = tmp_path / "store" / "nested" / "output.ndjson"
+    assert target.exists()
+    assert target.read_text().strip() == '{"id":1}'
+    assert transaction.committed is True
+
+
+class _FailingStorage(FileStorage):
+    """Storage whose commit always raises."""
+
+    async def commit(self, data, path):  # type: ignore[override]
+        raise OSError("simulated storage outage")
+
+
+@pytest.mark.asyncio
+async def test_storage_write_failure_propagates(tmp_path):
+    """A failing storage commit marks the transaction failed and re-raises."""
+    storage = _FailingStorage(root=tmp_path / "store")
+    exporter = build_exporter("ndjson")
+    dispatcher, crawler = _registry_and_crawler()
+
+    transaction = register_export_handlers(
+        dispatcher=dispatcher,
+        exporter=exporter,
+        crawler=crawler,
+        storage=storage,
+        file_path=None,
+        storage_relpath="out.ndjson",
+    )
+
+    await dispatcher.send_async("item_scraped", item=Item(data={"id": 1}), spider=None)
+    await dispatcher.send_async("spider_closed", spider=None, reason="finished")
+
+    assert transaction.committed is False
+    with pytest.raises(ExportError, match="Export failed"):
+        transaction.raise_if_failed()
+
+
+@pytest.mark.asyncio
+async def test_file_write_failure_propagates_and_keeps_old_file(tmp_path, monkeypatch):
+    """A failed commit leaves the previous complete file byte-identical."""
+    output_file = tmp_path / "out.ndjson"
+    previous = b'{"previous":true}\n'
+    output_file.write_bytes(previous)
+
+    exporter = build_exporter("ndjson")
+    dispatcher, crawler = _registry_and_crawler()
+
+    transaction = register_export_handlers(
+        dispatcher=dispatcher,
+        exporter=exporter,
+        crawler=crawler,
+        storage=None,
+        file_path=output_file,
+    )
+
+    await dispatcher.send_async("item_scraped", item=Item(data={"id": 1}), spider=None)
+
+    def boom(destination, payload):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("qcrawl.runner.export._commit_file_sync", boom)
+    await dispatcher.send_async("spider_closed", spider=None, reason="finished")
+
+    assert transaction.committed is False
+    with pytest.raises(ExportError):
+        transaction.raise_if_failed()
+    # The old file must be untouched and no temp files left behind.
+    assert output_file.read_bytes() == previous
+    assert not list(output_file.parent.glob(".*.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_serialization_failure_marks_transaction_failed(tmp_path):
+    """An exporter raising during serialize_item fails the whole transaction."""
+    output_file = tmp_path / "out.ndjson"
+
+    class BrokenExporter:
+        item_count = 0
+
+        def serialize_item(self, item):
+            raise ValueError("cannot serialize")
+
+        def close(self):
+            return b""
+
+    dispatcher, crawler = _registry_and_crawler()
+    transaction = register_export_handlers(
+        dispatcher=dispatcher,
+        exporter=BrokenExporter(),  # type: ignore[arg-type]
+        crawler=crawler,
+        storage=None,
+        file_path=output_file,
+    )
+
+    await dispatcher.send_async("item_scraped", item=Item(data={"id": 1}), spider=None)
+    await dispatcher.send_async("spider_closed", spider=None, reason="finished")
+
+    with pytest.raises(ExportError):
+        transaction.raise_if_failed()
+    assert not output_file.exists()
+
+
+@pytest.mark.asyncio
+async def test_rerun_replaces_file_with_fresh_document(tmp_path):
+    """A second successful run replaces (not appends to) the first run's file."""
+    output_file = tmp_path / "out.ndjson"
+    dispatcher, crawler = _registry_and_crawler()
+
+    for payload in ([{"id": 1}], [{"id": 2}, {"id": 3}]):
+        exporter = build_exporter("ndjson")
+        dispatcher, crawler = _registry_and_crawler()
+        transaction = register_export_handlers(
+            dispatcher=dispatcher,
+            exporter=exporter,
+            crawler=crawler,
+            storage=None,
+            file_path=output_file,
+        )
+        for row in payload:
+            await dispatcher.send_async("item_scraped", item=Item(data=row), spider=None)
+        await dispatcher.send_async("spider_closed", spider=None, reason="finished")
+        transaction.raise_if_failed()
+
+    lines = [ln for ln in output_file.read_text().splitlines() if ln.strip()]
+    assert lines == ['{"id":2}', '{"id":3}']
+
+
+def test_transaction_records_first_error_only():
+    """Only the first failure is retained as the cause; later ones are logged."""
+    txn = ExportTransaction()
+    first = OSError("first")
+    txn.fail(first, "phase 1")
+    txn.fail(RuntimeError("second"), "phase 2")
+
+    assert txn.error is first
+    with pytest.raises(ExportError) as exc_info:
+        txn.raise_if_failed()
+    assert exc_info.value.__cause__ is first
 
 
 @pytest.mark.asyncio
 async def test_register_export_handlers_requires_path_or_storage():
     """register_export_handlers raises TypeError when neither file_path nor storage provided."""
-    from types import SimpleNamespace
-
-    from qcrawl.runner.export import register_export_handlers
-    from qcrawl.signals import SignalRegistry
-
     exporter = build_exporter("ndjson")
-    registry = SignalRegistry()
-    dispatcher = registry.for_sender(None)
-    crawler = SimpleNamespace(_cli_signal_handlers=[])
+    dispatcher, crawler = _registry_and_crawler()
 
-    # Both storage and file_path are None - should raise
     with pytest.raises(
         TypeError,
         match="register_export_handlers requires either a Storage instance or a Path file_path",

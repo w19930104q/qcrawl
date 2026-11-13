@@ -66,6 +66,11 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nInterrupted, exiting...")
         raise SystemExit(130) from None
+    except Exception as e:
+        # An export write/serialization failure (or any run error) must not look
+        # like success: log and exit non-zero.
+        logging.error("Run failed: %s", e)
+        raise SystemExit(1) from e
 
 
 @dataclass

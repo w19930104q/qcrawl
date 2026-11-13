@@ -132,6 +132,7 @@ async def run(
 
         storage_obj: Storage | None = None
         storage_relpath: str | None = None
+        export_transaction = None
 
         if not export_path:
             # Merge spider-level custom_settings: instance overrides class
@@ -179,7 +180,7 @@ async def run(
             # If storage backend configured, pass storage to register_export_handlers
             # CLI args take precedence; if not provided, consult spider custom_settings.
             if storage_obj is not None:
-                register_export_handlers(
+                export_transaction = register_export_handlers(
                     global_dispatcher,
                     exporter,
                     crawler,
@@ -192,6 +193,11 @@ async def run(
                 except Exception:
                     logger.exception("Run failed")
                     raise
+                else:
+                    # Signal handlers swallow exceptions; re-raise any export
+                    # failure so the process exits non-zero and the caller knows
+                    # no new file was committed.
+                    export_transaction.raise_if_failed()
             else:
                 # Normalize sentinel for stdout or a normal filesystem path.
                 try:
@@ -205,20 +211,26 @@ async def run(
                     )
 
                 # Pass the Path (including '-'/'stdout' as Path('-')) so register_export_handlers
-                # can open via aiofiles or route to stdout.
+                # can resolve the stdout sentinel or the final destination path.
                 try:
-                    register_export_handlers(
+                    export_transaction = register_export_handlers(
                         global_dispatcher,
                         exporter,
                         crawler,
                         storage=None,
                         file_path=Path(export_path),
                     )
-                    try:
-                        await crawler.crawl()
-                    except Exception:
-                        logger.exception("Run failed")
-                        raise
                 except Exception as e:
-                    logger.exception("Failed to prepare/open export %s: %s", export_path, e)
+                    logger.exception("Failed to prepare export %s: %s", export_path, e)
                     raise
+
+                try:
+                    await crawler.crawl()
+                except Exception:
+                    logger.exception("Run failed")
+                    raise
+                else:
+                    # Signal handlers swallow exceptions; re-raise any export
+                    # failure so the process exits non-zero and the caller knows
+                    # no new file was committed.
+                    export_transaction.raise_if_failed()

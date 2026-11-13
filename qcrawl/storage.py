@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,6 +25,20 @@ class Storage:
         Args:
             data (bytes): Data to write.
             path (str): Relative path to write to.
+        """
+        raise NotImplementedError
+
+    async def commit(self, data: bytes, path: str) -> None:
+        """Atomically replace the file at `path` with `data`.
+
+        Unlike :meth:`write`, which appends, a commit is transactional: the
+        bytes are staged in a temporary file and moved into place only once the
+        full write succeeded, so an existing complete file is never overwritten
+        by a partial/failed run.
+
+        Args:
+            data (bytes): Complete document to persist.
+            path (str): Relative path to replace.
         """
         raise NotImplementedError
 
@@ -99,6 +115,35 @@ class FileStorage(Storage):
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
+
+    async def commit(self, data: bytes, path: str) -> None:
+        abs_path = self._resolve_within_root(path)
+        await asyncio.to_thread(self._commit_bytes_sync, abs_path, data)
+
+    def _commit_bytes_sync(self, path: Path, data: bytes) -> None:
+        """Atomically replace `path` with `data`.
+
+        Stages the bytes in a temporary file in the same directory (so the final
+        rename is atomic on POSIX), flushes/fsyncs it, then os.replace()s it into
+        place. On any failure the temporary file is removed and the previous
+        contents of `path` — if any — stay untouched.
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+        )
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        except BaseException:
+            # Never leave the staging file behind on failure.
+            with contextlib.suppress(OSError):
+                tmp_path.unlink()
+            raise
 
     async def read(self, path: str) -> bytes:
         abs_path = self._resolve_within_root(path)
